@@ -1,0 +1,171 @@
+name: settlement-diagnostics
+
+on:
+  push:
+    branches: [settlement-diagnostics]
+    paths: [.github/workflows/settlement-diagnostics.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: settlement-diagnostics-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  CI: "true"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  unit:
+    name: unit (${{ matrix.platform.name }}, ${{ matrix.source.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux
+            runner: ubuntu-24.04
+          - name: windows
+            runner: windows-2025
+        source:
+          - name: baseline
+            sha: 217cc811de9b0c1594924e89e48705871f1cacea
+          - name: candidate
+            sha: 78857fca51b85544811616edd82c830e2de22118
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_SHA: ${{ matrix.source.sha }}
+      OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ matrix.platform.name == 'windows' && 'true' || 'false' }}
+    steps:
+      - name: Checkout fixed source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ matrix.source.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source
+        id: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p validation-results
+          git show -s --format=fuller HEAD > validation-results/source.log
+
+      - name: Setup Bun and frozen workspace
+        id: setup
+        uses: ./.github/actions/setup-bun
+
+      - name: Install pinned ripgrep
+        id: ripgrep
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto"
+          import { execFileSync } from "node:child_process"
+          import fs from "node:fs"
+          import path from "node:path"
+          const windows = process.platform === "win32"
+          const platform = windows ? "x86_64-pc-windows-msvc" : "x86_64-unknown-linux-musl"
+          const archive = `ripgrep-15.1.0-${platform}.${windows ? "zip" : "tar.gz"}`
+          const expected = windows
+            ? "124510b94b6baa3380d051fdf4650eaa80a302c876d611e9dba0b2e18d87493a"
+            : "1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599"
+          const url = `https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/${archive}`
+          const response = await fetch(url, { signal: AbortSignal.timeout(60_000) })
+          if (!response.ok) throw new Error(`ripgrep download: HTTP ${response.status}`)
+          const bytes = Buffer.from(await response.arrayBuffer())
+          const actual = createHash("sha256").update(bytes).digest("hex")
+          if (actual !== expected) throw new Error(`ripgrep SHA256 mismatch: ${actual}`)
+          const directory = path.join(process.env.RUNNER_TEMP, "settlement-ripgrep")
+          fs.mkdirSync(directory, { recursive: true })
+          fs.writeFileSync(path.join(directory, archive), bytes)
+          const tar = windows ? path.join(process.env.SystemRoot, "System32", "tar.exe") : "tar"
+          execFileSync(tar, ["-xf", archive], { cwd: directory, stdio: "inherit" })
+          const bin = path.join(directory, `ripgrep-15.1.0-${platform}`)
+          const executable = path.join(bin, windows ? "rg.exe" : "rg")
+          const version = execFileSync(executable, ["--version"], { encoding: "utf8" })
+          fs.appendFileSync(process.env.GITHUB_PATH, bin + "\n")
+          fs.writeFileSync("validation-results/ripgrep.json", JSON.stringify({ url, sha256: actual, executable, version }, null, 2) + "\n")
+          console.log(version)
+          NODE
+
+      - name: Record runtime
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: |
+          node -e 'console.log(JSON.stringify({commit: process.env.SOURCE_SHA, platform: process.platform, arch: process.arch, cpus: require("node:os").availableParallelism(), memory: require("node:os").totalmem(), image: process.env.ImageOS, imageVersion: process.env.ImageVersion, versions: process.versions}, null, 2))' > validation-results/environment.json
+          bun --version > validation-results/bun-version.log
+          df -h . > validation-results/disk.log
+
+      - name: Configure ephemeral git identity
+        run: |
+          git config --global user.email "bot@opencode.ai"
+          git config --global user.name "opencode"
+
+      - name: Repeat settlement regression tests
+        id: focused
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && steps.ripgrep.outcome == 'success' }}
+        timeout-minutes: 5
+        working-directory: packages/core
+        run: GITHUB_ACTIONS=false bun run script/test.ts test/form.test.ts test/permission.test.ts --rerun-each 10 --randomize --seed 34853 2>&1 | tee ../../validation-results/settlement.log
+
+      - name: Reproduce Windows contender assertion
+        id: contender
+        if: ${{ runner.os == 'Windows' && !cancelled() && steps.setup.outcome == 'success' && steps.ripgrep.outcome == 'success' }}
+        timeout-minutes: 5
+        working-directory: packages/client
+        run: GITHUB_ACTIONS=false bun test --timeout 5000 test/service.test.ts --test-name-pattern '^waits for a slow winner while bounding lock probes$' --rerun-each 20 2>&1 | tee ../../validation-results/contender.log
+
+      - name: Repeat observed Linux TUI cases
+        id: tui
+        if: ${{ runner.os == 'Linux' && !cancelled() && steps.setup.outcome == 'success' && steps.ripgrep.outcome == 'success' }}
+        timeout-minutes: 8
+        working-directory: packages/tui
+        run: GITHUB_ACTIONS=false bun run test test/session-group-navigation.test.tsx test/mini/footer.view.test.tsx --test-name-pattern '^(restores exact part/group anchors at width|running footer abbreviates only the model and stops at an oversized)' --rerun-each 10 --randomize --seed 34853 2>&1 | tee ../../validation-results/tui.log
+
+      - name: Run all workspace unit tasks to completion
+        id: workspace
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && steps.ripgrep.outcome == 'success' }}
+        timeout-minutes: 20
+        run: GITHUB_ACTIONS=false bun turbo test --concurrency=3 --continue=always --summarize 2>&1 | tee validation-results/unit.log
+
+      - name: Verify tracked source integrity
+        id: integrity
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        run: git diff --exit-code "$SOURCE_SHA" 2>&1 | tee validation-results/integrity.log
+
+      - name: Record test outcomes
+        if: ${{ always() && steps.source.outcome == 'success' }}
+        env:
+          RIPGREP_OUTCOME: ${{ steps.ripgrep.outcome }}
+          FOCUSED_OUTCOME: ${{ steps.focused.outcome }}
+          CONTENDER_OUTCOME: ${{ steps.contender.outcome }}
+          TUI_OUTCOME: ${{ steps.tui.outcome }}
+          WORKSPACE_OUTCOME: ${{ steps.workspace.outcome }}
+          INTEGRITY_OUTCOME: ${{ steps.integrity.outcome }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from "node:fs"
+          import path from "node:path"
+          const outcomes = Object.fromEntries(Object.entries(process.env).filter(([name]) => name.endsWith("_OUTCOME")))
+          fs.writeFileSync("validation-results/outcomes.json", JSON.stringify(outcomes, null, 2) + "\n")
+          const directory = ".turbo/runs"
+          if (fs.existsSync(directory)) {
+            fs.mkdirSync("validation-results/turbo", { recursive: true })
+            for (const name of fs.readdirSync(directory)) {
+              if (name.endsWith(".json")) fs.copyFileSync(path.join(directory, name), path.join("validation-results/turbo", name))
+            }
+          }
+          NODE
+
+      - name: Upload evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: diagnostic-${{ matrix.platform.name }}-${{ matrix.source.name }}
+          path: validation-results/
+          retention-days: 30
+          if-no-files-found: warn
