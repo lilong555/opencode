@@ -1,0 +1,164 @@
+name: settlement-validation
+
+on:
+  push:
+    branches: [settlement-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: settlement-validation-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  CI: "true"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  check:
+    name: check (${{ matrix.source.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        source:
+          - name: baseline
+            sha: 217cc811de9b0c1594924e89e48705871f1cacea
+          - name: candidate
+            sha: 78857fca51b85544811616edd82c830e2de22118
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_SHA: ${{ matrix.source.sha }}
+    steps:
+      - name: Checkout fixed source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ matrix.source.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source
+        id: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p validation-results
+          git show -s --format=fuller HEAD > validation-results/source.log
+
+      - name: Setup Bun and frozen workspace
+        id: setup
+        uses: ./.github/actions/setup-bun
+
+      - name: Record runtime
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: |
+          node -e 'console.log(JSON.stringify({commit: process.env.SOURCE_SHA, platform: process.platform, arch: process.arch, cpus: require("node:os").availableParallelism(), memory: require("node:os").totalmem(), image: process.env.ImageOS, imageVersion: process.env.ImageVersion, versions: process.versions}, null, 2))' > validation-results/environment.json
+          bun --version > validation-results/bun-version.log
+          df -h . > validation-results/disk.log
+
+      - name: Canonical workspace check
+        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.setup.outcome == 'success' }}
+        timeout-minutes: 20
+        run: bun run check 2>&1 | tee validation-results/check.log
+
+      - name: Official TypeScript workspace check
+        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.setup.outcome == 'success' }}
+        timeout-minutes: 20
+        run: bun run typecheck:tsc 2>&1 | tee validation-results/typecheck-tsc.log
+
+      - name: Verify tracked source integrity
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        run: git diff --exit-code "$SOURCE_SHA" 2>&1 | tee validation-results/integrity.log
+
+      - name: Upload evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: check-${{ matrix.source.name }}
+          path: validation-results/
+          retention-days: 30
+          if-no-files-found: warn
+
+  unit:
+    name: unit (${{ matrix.platform.name }}, ${{ matrix.source.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux
+            runner: ubuntu-24.04
+          - name: windows
+            runner: windows-2025
+        source:
+          - name: baseline
+            sha: 217cc811de9b0c1594924e89e48705871f1cacea
+          - name: candidate
+            sha: 78857fca51b85544811616edd82c830e2de22118
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_SHA: ${{ matrix.source.sha }}
+      OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ matrix.platform.name == 'windows' && 'true' || 'false' }}
+    steps:
+      - name: Checkout fixed source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ matrix.source.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source
+        id: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p validation-results
+          git show -s --format=fuller HEAD > validation-results/source.log
+
+      - name: Setup Bun and frozen workspace
+        id: setup
+        uses: ./.github/actions/setup-bun
+
+      - name: Record runtime
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: |
+          node -e 'console.log(JSON.stringify({commit: process.env.SOURCE_SHA, platform: process.platform, arch: process.arch, cpus: require("node:os").availableParallelism(), memory: require("node:os").totalmem(), image: process.env.ImageOS, imageVersion: process.env.ImageVersion, versions: process.versions}, null, 2))' > validation-results/environment.json
+          bun --version > validation-results/bun-version.log
+          df -h . > validation-results/disk.log
+
+      - name: Configure ephemeral git identity
+        run: |
+          git config --global user.email "bot@opencode.ai"
+          git config --global user.name "opencode"
+
+      - name: Test Effect simplification rules
+        if: ${{ runner.os == 'Linux' && !cancelled() && steps.setup.outcome == 'success' }}
+        run: bun run test:effect-simplification-rules 2>&1 | tee validation-results/effect-rule-tests.log
+
+      - name: Check Effect simplifications
+        if: ${{ runner.os == 'Linux' && !cancelled() && steps.setup.outcome == 'success' }}
+        run: bun run lint:effect-simplifications 2>&1 | tee validation-results/effect-rules.log
+
+      - name: Run workspace unit tests
+        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.setup.outcome == 'success' }}
+        timeout-minutes: 20
+        run: GITHUB_ACTIONS=false bun turbo test --concurrency=3 2>&1 | tee validation-results/unit.log
+
+      - name: Verify tracked source integrity
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        run: git diff --exit-code "$SOURCE_SHA" 2>&1 | tee validation-results/integrity.log
+
+      - name: Upload evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unit-${{ matrix.platform.name }}-${{ matrix.source.name }}
+          path: validation-results/
+          retention-days: 30
+          if-no-files-found: warn
